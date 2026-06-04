@@ -1,497 +1,175 @@
-/* =============================================================================
- *  IoT TCP Socket Programming - ESP32 Client (Hardware Nyata)
- *  -----------------------------------------------------------------------------
- *  Penulis  : Kelompok 4
- *  Hardware : ESP32 DevKit + SSD1306 OLED + HC-SR04 + LDR module + Water sensor
- *             + Servo SG90 + 3 Push Button + 3 LED + MB-102 power supply
- *  Protokol : TCP socket murni (port default 5000) langsung ke laptop di LAN
- *             yang sama. Tidak pakai HTTP, tidak pakai ngrok.
+/*
+ * Water Monitoring IoT - CLIENT (ESP32 DevKit V1)
+ * ------------------------------------------------
+ * Membaca 3 sensor lalu mengirim data JSON ke server Flask via WiFi (HTTP POST).
  *
- *  ===========================================================================
- *  STRUKTUR MODULAR
- *  ===========================================================================
- *  Untuk MENAMBAH SENSOR baru:
- *    1. Tulis fungsi `void initX()` dan `float readX()`.
- *    2. Tambah satu baris di array `sensors[]`:
- *         {"key_json", initX, readX, 0}
- *    3. (Opsional) Tambah satu baris di updateDisplay() supaya muncul di OLED.
+ * Sensor:
+ *   - Water level (S, +, -)  -> analog (resistif, berbasis kontak air)
+ *   - HC-SR04 ultrasonik     -> jarak permukaan air (Trig/Echo)
+ *   - LDR modul (AO/DO)      -> intensitas cahaya
  *
- *  Untuk MENAMBAH COMMAND dari server:
- *    1. Tulis fungsi `void cmdX(const String& arg)`.
- *    2. Tambah satu baris di array `commands[]`:
- *         {"NAMA_COMMAND", cmdX}
+ * PENTING (lihat README):
+ *   - Echo HC-SR04 keluar 5V -> WAJIB pakai voltage divider ke GPIO 19.
+ *   - Beri + water sensor dari 3V3 (bukan 5V) supaya output analog <= 3.3V.
+ *   - Semua GND harus terhubung jadi satu (common ground).
  *
- *  ===========================================================================
- *  TOMBOL
- *  ===========================================================================
- *    Tombol A (GPIO 14) : Toggle AUTO mode ON/OFF
- *    Tombol B (GPIO 32) : Kirim data sensor SEKARANG (manual)
- *    Tombol C (GPIO 33) : Cycle posisi servo (0 -> 90 -> 180 -> 0 ...)
- *
- *  ===========================================================================
- *  LED INDIKATOR
- *  ===========================================================================
- *    HIJAU  (GPIO 27) : SUKSES (terhubung & kirim/terima OK)
- *    KUNING (GPIO 26) : BUSY (sedang menyambung / mengirim)
- *    MERAH  (GPIO 25) : ERROR (WiFi mati / koneksi terputus)
- *
- *  ===========================================================================
- *  PROTOKOL TCP (line-delimited, satu pesan per baris diakhiri "\n")
- *  ===========================================================================
- *  ESP32 -> Server (JSON):
- *    {"type":"hello","client":"esp32-kel4"}
- *    {"type":"data","dist":12.34,"light":2150,"water":456}
- *    {"type":"event","button":"A","auto":true}
- *
- *  Server -> ESP32 (plain text, "NAMA <argumen>"):
- *    SERVO 90
- *    MSG hello dunia
- *    LED red on
- *    LED green off
- *    PING
- * ============================================================================= */
+ * Arduino IDE:
+ *   Board  : "DOIT ESP32 DEVKIT V1"
+ *   Letakkan file ini di folder bernama "water_monitor".
+ */
 
 #include <WiFi.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <ESP32Servo.h>
+#include <HTTPClient.h>
 
-// ---------------------------------------------------------------------------
-// 1. KONFIGURASI WIFI & SERVER
-// ---------------------------------------------------------------------------
-// GANTI dengan SSID & password WiFi yang sama dengan laptop server
-const char* WIFI_SSID = "GANTI_NAMA_WIFI";
-const char* WIFI_PASS = "GANTI_PASSWORD_WIFI";
+// ============================ KONFIGURASI ============================
+const char* WIFI_SSID     = "ditapao";
+const char* WIFI_PASSWORD = "kepoparahh";
 
-// GANTI dengan IP laptop di jaringan lokal.
-// Cek di laptop: `ipconfig` (Windows) atau `ifconfig` / `ip a` (Linux/Mac).
-// Cari "IPv4 Address" di adapter WiFi yang aktif. Contoh: 192.168.1.42
-const char* SERVER_IP   = "192.168.1.42";
-const uint16_t SERVER_PORT = 5000;
+// Alamat endpoint server (lihat baris yang dicetak saat menjalankan server.py)
+const char* SERVER_URL    = "http://172.20.10.2:5000/api/data";
 
-// ---------------------------------------------------------------------------
-// 2. PIN MAPPING
-// ---------------------------------------------------------------------------
-// Sensor
-#define PIN_TRIG     5    // HC-SR04 trigger (output)
-#define PIN_ECHO    18    // HC-SR04 echo    (input)
-#define PIN_LDR     34    // LDR module AO   (ADC1, input-only)
-#define PIN_WATER   35    // Water sensor S  (ADC1, input-only)
+const char* DEVICE_ID     = "esp32-water-01";
 
-// Aktuator
-#define PIN_SERVO    4    // Servo signal (PWM)
+// Tinggi tangki = jarak dari sensor ultrasonik (di atas) ke dasar saat KOSONG.
+const float TANK_HEIGHT_CM = 30.0f;
 
-// Tombol (active LOW, INPUT_PULLUP)
-// Hindari GPIO 0/2/12/15 - itu strapping pin yang bisa bikin boot fail
-#define BTN_A       14    // Toggle AUTO mode
-#define BTN_B       32    // Kirim manual
-#define BTN_C       33    // Cycle servo
+// Selang waktu kirim data (milidetik)
+const unsigned long SEND_INTERVAL_MS = 5000;
 
-// LED status (active HIGH)
-#define LED_RED     25
-#define LED_GREEN   27
-#define LED_YELLOW  26
+// ============================ PIN MAP ===============================
+const int PIN_WATER_ANALOG = 34;  // Water level "S"  (ADC1, input-only)
+const int PIN_LDR_ANALOG   = 35;  // LDR "AO"         (ADC1, input-only)
+const int PIN_LDR_DIGITAL  = 23;  // LDR "DO"
+const int PIN_TRIG         = 18;  // HC-SR04 Trig
+const int PIN_ECHO         = 19;  // HC-SR04 Echo (LEWAT VOLTAGE DIVIDER!)
 
-// I2C OLED: SDA=21, SCL=22 (default ESP32)
+const int ADC_MAX = 4095;         // resolusi 12-bit
 
-// ---------------------------------------------------------------------------
-// 3. OBJEK GLOBAL
-// ---------------------------------------------------------------------------
-Adafruit_SSD1306 display(128, 64, &Wire, -1);
-Servo servo;
-WiFiClient client;          // socket TCP ke server
+unsigned long lastSend = 0;
 
-// ---------------------------------------------------------------------------
-// 4. STATE
-// ---------------------------------------------------------------------------
-bool autoMode               = true;
-int  servoAngle             = 0;
-unsigned long lastSendMs    = 0;
-unsigned long lastBtnMs     = 0;
-unsigned long lastSensorMs  = 0;
-unsigned long lastDrawMs    = 0;
-unsigned long lastReconMs   = 0;
-unsigned long sentCount     = 0;
-String        lastMsgFromServer = "(none)";
-String        rxBuffer;     // buffer baca line-by-line dari server
+// ---------------------------------------------------------- WiFi
+void connectWiFi() {
+  Serial.print("Menghubungkan ke WiFi \"");
+  Serial.print(WIFI_SSID);
+  Serial.print("\" ");
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-const unsigned long PERIOD_MS    = 3000;   // interval kirim AUTO
-const unsigned long DEBOUNCE_MS  = 250;
-const unsigned long RECONNECT_MS = 5000;   // jeda antar percobaan reconnect
-
-// ---------------------------------------------------------------------------
-// 5. UTILITY: LED status (mutually exclusive)
-// ---------------------------------------------------------------------------
-enum LedState { LED_OFF, LED_OK, LED_BUSY, LED_ERR };
-void setLed(LedState s) {
-  digitalWrite(LED_GREEN,  s == LED_OK   ? HIGH : LOW);
-  digitalWrite(LED_YELLOW, s == LED_BUSY ? HIGH : LOW);
-  digitalWrite(LED_RED,    s == LED_ERR  ? HIGH : LOW);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("Terhubung. IP ESP32: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[!] Gagal terhubung. Cek SSID/password.");
+  }
 }
 
-// ===========================================================================
-// 6. SENSOR REGISTRY  -- bagian utama untuk extensibility
-// ===========================================================================
-typedef void  (*SensorInitFn)();
-typedef float (*SensorReadFn)();
-
-struct Sensor {
-  const char*  key;        // nama field di JSON yang dikirim ke server
-  SensorInitFn init;       // fungsi inisialisasi (panggil di setup)
-  SensorReadFn read;       // fungsi baca, kembalikan float
-  float        lastValue;  // cache nilai terakhir untuk display & kirim
-};
-
-// ---- Implementasi sensor: HC-SR04 ----
-void  initUltrasonic() {
-  pinMode(PIN_TRIG, OUTPUT);
-  pinMode(PIN_ECHO, INPUT);
-}
-float readUltrasonic() {
+// ------------------------------------------------- Baca HC-SR04
+// Mengembalikan jarak dalam cm, atau -1 jika tidak ada echo / di luar jangkauan.
+float readDistanceCm() {
   digitalWrite(PIN_TRIG, LOW);
   delayMicroseconds(2);
   digitalWrite(PIN_TRIG, HIGH);
   delayMicroseconds(10);
   digitalWrite(PIN_TRIG, LOW);
-  long dur = pulseIn(PIN_ECHO, HIGH, 30000UL);   // timeout 30 ms
-  if (dur == 0) return -1.0f;
-  return (dur * 0.0343f) / 2.0f;                 // cm
+
+  // pulseIn: lama pulsa HIGH di Echo, timeout 30 ms (~5 meter)
+  long duration = pulseIn(PIN_ECHO, HIGH, 30000UL);
+  if (duration == 0) return -1.0f;
+
+  // jarak = (durasi_us * 0.0343 cm/us) / 2  (bolak-balik)
+  return (duration * 0.0343f) / 2.0f;
 }
 
-// ---- Implementasi sensor: LDR module ----
-void  initLDR() { /* analog input - tidak perlu setup pin */ }
-float readLDR() { return (float)analogRead(PIN_LDR); }   // 0..4095
-
-// ---- Implementasi sensor: Water sensor ----
-void  initWater() { /* analog input - tidak perlu setup pin */ }
-float readWater() { return (float)analogRead(PIN_WATER); }
-
-// ---- Daftar sensor aktif ----
-// Tambah sensor baru cukup tambah satu baris di sini.
-Sensor sensors[] = {
-  { "dist",  initUltrasonic, readUltrasonic, 0 },
-  { "light", initLDR,        readLDR,        0 },
-  { "water", initWater,      readWater,      0 }
-};
-const int N_SENSORS = sizeof(sensors) / sizeof(sensors[0]);
-
-// ===========================================================================
-// 7. COMMAND REGISTRY  -- handler untuk pesan dari server
-// ===========================================================================
-typedef void (*CmdFn)(const String& arg);
-
-struct Command {
-  const char* name;
-  CmdFn       handler;
-};
-
-// ---- Handler: SERVO <angle> ----
-void cmdServo(const String& arg) {
-  int a = arg.toInt();
-  if (a < 0)   a = 0;
-  if (a > 180) a = 180;
-  servoAngle = a;
-  servo.write(a);
-  Serial.println("[CMD] SERVO -> " + String(a));
-}
-
-// ---- Handler: MSG <text> ----
-void cmdMsg(const String& arg) {
-  lastMsgFromServer = arg;
-  Serial.println("[CMD] MSG -> " + arg);
-}
-
-// ---- Handler: LED <color> <on|off> ----
-void cmdLed(const String& arg) {
-  int sp = arg.indexOf(' ');
-  if (sp < 0) { Serial.println("[CMD] LED format salah"); return; }
-  String color = arg.substring(0, sp); color.trim();
-  String state = arg.substring(sp + 1); state.trim();
-  bool on = (state == "on" || state == "1" || state == "ON");
-
-  int pin = -1;
-  if      (color == "red")    pin = LED_RED;
-  else if (color == "green")  pin = LED_GREEN;
-  else if (color == "yellow") pin = LED_YELLOW;
-  else { Serial.println("[CMD] LED warna tidak dikenal: " + color); return; }
-
-  digitalWrite(pin, on ? HIGH : LOW);
-  Serial.println("[CMD] LED " + color + " -> " + (on ? "ON" : "OFF"));
-}
-
-// ---- Handler: PING (server cek apakah ESP32 hidup) ----
-void cmdPing(const String& arg) {
-  if (client.connected()) client.println("{\"type\":\"pong\"}");
-  Serial.println("[CMD] PING -> pong");
-}
-
-// ---- Daftar command aktif ----
-// Tambah command baru cukup tambah satu baris di sini.
-Command commands[] = {
-  { "SERVO", cmdServo },
-  { "MSG",   cmdMsg   },
-  { "LED",   cmdLed   },
-  { "PING",  cmdPing  }
-};
-const int N_COMMANDS = sizeof(commands) / sizeof(commands[0]);
-
-// ---------------------------------------------------------------------------
-// 8. OLED: satu fungsi untuk redraw seluruh layar
-// ---------------------------------------------------------------------------
-void updateDisplay() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-
-  // Baris 1: mode + status koneksi
-  display.print(F("Mode:"));
-  display.print(autoMode ? F("AUTO ") : F("MANL "));
-  display.println(client.connected() ? F("ON") : F("OFF"));
-
-  // Baris 2: IP
-  if (WiFi.status() == WL_CONNECTED) display.println(WiFi.localIP());
-  else                               display.println(F("WiFi offline"));
-
-  // Baris 3-5: nilai sensor (bisa diperbanyak/dipersingkat sesuai daftar sensor)
-  display.print(F("Dst:"));
-  if (sensors[0].lastValue < 0) display.println(F(" --"));
-  else { display.print(sensors[0].lastValue, 1); display.println(F(" cm")); }
-
-  display.print(F("Lit:"));
-  display.println((int)sensors[1].lastValue);
-
-  display.print(F("Wtr:"));
-  display.println((int)sensors[2].lastValue);
-
-  // Baris 6: pesan terakhir dari server (potong jika kepanjangan)
-  display.print(F("M:"));
-  String m = lastMsgFromServer;
-  if (m.length() > 18) m = m.substring(0, 18);
-  display.println(m);
-
-  display.display();
-}
-
-// ---------------------------------------------------------------------------
-// 9. Baca semua sensor sekaligus (panggil tiap N ms)
-// ---------------------------------------------------------------------------
-void readAllSensors() {
-  for (int i = 0; i < N_SENSORS; i++) {
-    sensors[i].lastValue = sensors[i].read();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 10. Kirim data sensor ke server (satu baris JSON)
-// ---------------------------------------------------------------------------
-bool sendData() {
-  if (!client.connected()) return false;
-
-  setLed(LED_BUSY);
-
-  // Bangun JSON secara dinamis berdasarkan isi sensors[]
-  String json = "{\"type\":\"data\"";
-  for (int i = 0; i < N_SENSORS; i++) {
-    json += ",\"";
-    json += sensors[i].key;
-    json += "\":";
-    json += String(sensors[i].lastValue, 2);
-  }
-  json += "}\n";
-
-  size_t written = client.print(json);
-  if (written == json.length()) {
-    sentCount++;
-    setLed(LED_OK);
-    Serial.println("[TX] " + json);
-    return true;
-  } else {
-    setLed(LED_ERR);
-    Serial.println("[TX] gagal kirim (short write)");
-    return false;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 11. Polling pesan masuk dari server (non-blocking)
-// ---------------------------------------------------------------------------
-void handleCommandLine(const String& line) {
-  // Format: "NAMA <args...>"
-  int sp = line.indexOf(' ');
-  String name = (sp < 0) ? line : line.substring(0, sp);
-  String arg  = (sp < 0) ? ""   : line.substring(sp + 1);
-  name.trim(); arg.trim();
-  name.toUpperCase();
-
-  for (int i = 0; i < N_COMMANDS; i++) {
-    if (name == commands[i].name) {
-      commands[i].handler(arg);
-      return;
-    }
-  }
-  Serial.println("[CMD] command tidak dikenal: " + name);
-}
-
-void pollIncoming() {
-  while (client.connected() && client.available()) {
-    char c = client.read();
-    if (c == '\n') {
-      rxBuffer.trim();
-      if (rxBuffer.length() > 0) handleCommandLine(rxBuffer);
-      rxBuffer = "";
-    } else if (c != '\r') {
-      rxBuffer += c;
-      if (rxBuffer.length() > 200) rxBuffer = "";   // safety guard
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 12. Pastikan terhubung ke server (reconnect bila perlu)
-// ---------------------------------------------------------------------------
-void ensureConnected() {
-  if (client.connected()) return;
-  if (millis() - lastReconMs < RECONNECT_MS) return;
-  lastReconMs = millis();
-
-  setLed(LED_BUSY);
-  Serial.print("[NET] connect ke ");
-  Serial.print(SERVER_IP); Serial.print(":"); Serial.println(SERVER_PORT);
-
-  if (client.connect(SERVER_IP, SERVER_PORT)) {
-    client.setNoDelay(true);
-    setLed(LED_OK);
-    Serial.println("[NET] CONNECTED");
-    // Kirim hello supaya server tahu siapa
-    client.println("{\"type\":\"hello\",\"client\":\"esp32-kel4\"}");
-  } else {
-    setLed(LED_ERR);
-    Serial.println("[NET] connect FAILED");
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 13. SETUP
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------- Setup
 void setup() {
   Serial.begin(115200);
-  delay(200);
-  Serial.println("\n=== Kelompok 4 - ESP32 IoT TCP Client ===");
+  delay(300);
+  Serial.println("\nWater Monitoring - ESP32 client");
 
-  // GPIO non-sensor
-  pinMode(BTN_A, INPUT_PULLUP);
-  pinMode(BTN_B, INPUT_PULLUP);
-  pinMode(BTN_C, INPUT_PULLUP);
-  pinMode(LED_RED,    OUTPUT);
-  pinMode(LED_GREEN,  OUTPUT);
-  pinMode(LED_YELLOW, OUTPUT);
-  setLed(LED_OFF);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_LDR_DIGITAL, INPUT);
+  digitalWrite(PIN_TRIG, LOW);
+  // Pin analog (34, 35) tidak perlu pinMode.
 
-  // OLED
-  Wire.begin(21, 22);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("[ERR] OLED 0x3C tidak ditemukan!");
-    setLed(LED_ERR);
-    while (true) delay(200);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(F("Kelompok 4"));
-  display.println(F("IoT TCP Client"));
-  display.println(F("Booting..."));
-  display.display();
+  analogReadResolution(12);   // 0..4095
 
-  // Inisialisasi semua sensor (loop di atas sensors[])
-  for (int i = 0; i < N_SENSORS; i++) sensors[i].init();
-
-  // Servo
-  servo.attach(PIN_SERVO);
-  servo.write(servoAngle);
-
-  // WiFi
-  setLed(LED_BUSY);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("[WiFi] connecting");
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000UL) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("[WiFi] OK, IP=" + WiFi.localIP().toString());
-    setLed(LED_OK);
-  } else {
-    Serial.println("[WiFi] FAILED");
-    setLed(LED_ERR);
-  }
+  connectWiFi();
 }
 
-// ---------------------------------------------------------------------------
-// 14. LOOP UTAMA
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------- Loop
 void loop() {
+  if (millis() - lastSend < SEND_INTERVAL_MS) return;
+  lastSend = millis();
 
-  // 14a. Pastikan TCP tersambung
-  ensureConnected();
+  // ---- Baca semua sensor ----
+  float distance = readDistanceCm();
 
-  // 14b. Baca semua sensor tiap 500 ms
-  if (millis() - lastSensorMs > 500) {
-    lastSensorMs = millis();
-    readAllSensors();
+  float waterLevelCm  = -1.0f;
+  float waterLevelPct = -1.0f;
+  if (distance >= 0) {
+    waterLevelCm = TANK_HEIGHT_CM - distance;
+    if (waterLevelCm < 0) waterLevelCm = 0;
+    if (waterLevelCm > TANK_HEIGHT_CM) waterLevelCm = TANK_HEIGHT_CM;
+    waterLevelPct = (waterLevelCm / TANK_HEIGHT_CM) * 100.0f;
   }
 
-  // 14c. Refresh OLED tiap 500 ms
-  if (millis() - lastDrawMs > 500) {
-    lastDrawMs = millis();
-    updateDisplay();
-  }
+  int   waterRaw    = analogRead(PIN_WATER_ANALOG);
+  float waterRawPct = (waterRaw / (float)ADC_MAX) * 100.0f;
 
-  // 14d. Cek pesan masuk dari server
-  pollIncoming();
+  int   ldrRaw     = analogRead(PIN_LDR_ANALOG);
+  float ldrPct     = (ldrRaw / (float)ADC_MAX) * 100.0f;
+  int   ldrDigital = digitalRead(PIN_LDR_DIGITAL);
+  // Catatan: banyak modul -> DO LOW saat terang, HIGH saat gelap.
+  // Jika terbalik di modul Anda, ubah baris berikut.
+  bool  ldrDark = (ldrDigital == HIGH);
 
-  // 14e. Tombol A: toggle AUTO
-  if (digitalRead(BTN_A) == LOW && millis() - lastBtnMs > DEBOUNCE_MS) {
-    lastBtnMs = millis();
-    autoMode = !autoMode;
-    Serial.println(autoMode ? "[BTN A] AUTO ON" : "[BTN A] AUTO OFF");
-    if (client.connected()) {
-      String ev = "{\"type\":\"event\",\"button\":\"A\",\"auto\":";
-      ev += (autoMode ? "true" : "false");
-      ev += "}\n";
-      client.print(ev);
+  // ---- Cetak ke Serial Monitor ----
+  Serial.println("----- Pembacaan -----");
+  Serial.printf("Jarak ultrasonik : %.1f cm\n", distance);
+  Serial.printf("Tinggi air       : %.1f cm (%.0f%%)\n", waterLevelCm, waterLevelPct);
+  Serial.printf("Water analog     : %d (%.0f%%)\n", waterRaw, waterRawPct);
+  Serial.printf("LDR analog       : %d (%.0f%%)\n", ldrRaw, ldrPct);
+  Serial.printf("LDR digital      : %s\n", ldrDark ? "gelap" : "terang");
+
+  // ---- Kirim ke server ----
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    char payload[384];
+    snprintf(payload, sizeof(payload),
+      "{"
+        "\"device_id\":\"%s\","
+        "\"distance_cm\":%.1f,"
+        "\"water_level_cm\":%.1f,"
+        "\"water_level_pct\":%.1f,"
+        "\"water_analog_raw\":%d,"
+        "\"water_analog_pct\":%.1f,"
+        "\"ldr_raw\":%d,"
+        "\"ldr_pct\":%.1f,"
+        "\"ldr_dark\":%s,"
+        "\"uptime_ms\":%lu"
+      "}",
+      DEVICE_ID, distance, waterLevelCm, waterLevelPct,
+      waterRaw, waterRawPct, ldrRaw, ldrPct,
+      ldrDark ? "true" : "false", millis());
+
+    HTTPClient http;
+    http.begin(SERVER_URL);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST((uint8_t*)payload, strlen(payload));
+    if (code > 0) {
+      Serial.printf("POST -> HTTP %d\n", code);
+    } else {
+      Serial.printf("POST gagal: %s\n", http.errorToString(code).c_str());
     }
-  }
-
-  // 14f. Tombol B: kirim manual
-  if (digitalRead(BTN_B) == LOW && millis() - lastBtnMs > DEBOUNCE_MS) {
-    lastBtnMs = millis();
-    Serial.println("[BTN B] manual send");
-    sendData();
-  }
-
-  // 14g. Tombol C: cycle servo 0 -> 90 -> 180 -> 0 ...
-  if (digitalRead(BTN_C) == LOW && millis() - lastBtnMs > DEBOUNCE_MS) {
-    lastBtnMs = millis();
-    servoAngle = (servoAngle == 0) ? 90 : (servoAngle == 90 ? 180 : 0);
-    servo.write(servoAngle);
-    Serial.println("[BTN C] servo -> " + String(servoAngle));
-    if (client.connected()) {
-      String ev = "{\"type\":\"event\",\"button\":\"C\",\"servo\":";
-      ev += servoAngle;
-      ev += "}\n";
-      client.print(ev);
-    }
-  }
-
-  // 14h. AUTO mode: kirim periodik
-  if (autoMode && client.connected() && millis() - lastSendMs > PERIOD_MS) {
-    lastSendMs = millis();
-    sendData();
+    http.end();
   }
 }
